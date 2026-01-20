@@ -61,7 +61,13 @@ class GeminiChat:
         Returns:
             Hebrew response text
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         try:
+            logger.info(f"Querying Gemini with store: {store_name}")
+            logger.info(f"Question: {question}")
+
             response = await self._run_sync(
                 self.client.models.generate_content,
                 model=self.model,
@@ -81,13 +87,21 @@ class GeminiChat:
                 )
             )
 
+            logger.info(f"Gemini response candidates: {len(response.candidates) if response.candidates else 0}")
+
+            # Check if file search was used
+            if response.candidates and response.candidates[0].grounding_metadata:
+                logger.info(f"Grounding metadata: {response.candidates[0].grounding_metadata}")
+
             if response.text:
+                logger.info(f"Response length: {len(response.text)}")
                 return response.text
             else:
+                logger.warning("No text in Gemini response")
                 return "לא הצלחתי למצוא תשובה במסמכים. נסה לנסח את השאלה אחרת."
 
         except Exception as e:
-            print(f"Gemini query error: {e}")
+            logger.error(f"Gemini query error: {e}", exc_info=True)
             return "אירעה שגיאה בעת חיפוש התשובה. נא לנסות שוב."
 
     async def query_with_context(
