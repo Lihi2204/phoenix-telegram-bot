@@ -30,13 +30,13 @@ class GeminiChat:
 - "לא מצאתי במסמכים מידע על כיסוי לטיפול ספציפי זה. מומלץ לפנות לסוכן הביטוח שלך לבירור."
 """
 
-    def __init__(self, api_key: str, model: str = "gemini-3-pro"):
+    def __init__(self, api_key: str, model: str = "gemini-2.5-pro"):
         """
         Initialize Gemini chat client.
 
         Args:
             api_key: Google Gemini API key
-            model: Model name to use (default: gemini-3-pro)
+            model: Model name to use (default: gemini-2.5-pro)
         """
         self.client = genai.Client(api_key=api_key)
         self.model = model
