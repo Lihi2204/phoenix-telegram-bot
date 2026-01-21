@@ -132,6 +132,43 @@ class PhoenixDownloader:
         clean = clean[:60]
         return clean
 
+    async def _close_any_dialogs(self, page: Page):
+        """Close any open dialogs/overlays that might be blocking."""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        try:
+            # Check for overlay backdrop
+            overlay = page.locator('.cdk-overlay-backdrop, .dialog-background, .modal-backdrop')
+            if await overlay.count() > 0:
+                logger.info("Found overlay/dialog, attempting to close...")
+
+                # Try pressing Escape
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(1)
+
+                # If still there, try clicking outside
+                if await overlay.count() > 0:
+                    # Click on the overlay to close it
+                    try:
+                        await overlay.first.click(force=True)
+                        await asyncio.sleep(1)
+                    except:
+                        pass
+
+                # Try finding and clicking close button
+                close_btns = page.locator('button:has-text("סגור"), button:has-text("ביטול"), button[aria-label*="close"], .close-button, [mat-dialog-close]')
+                if await close_btns.count() > 0:
+                    try:
+                        await close_btns.first.click()
+                        await asyncio.sleep(1)
+                    except:
+                        pass
+
+                logger.info("Dialog close attempt completed")
+        except Exception as e:
+            logger.debug(f"Error closing dialog: {e}")
+
     async def initiate_login(self) -> bool:
         """
         Phase 1: Enter credentials and request OTP.
@@ -366,6 +403,18 @@ class PhoenixDownloader:
                         downloaded_files.append(policy_details_path)
                         self.download_count += 1
 
+                    # Close any dialogs that might have opened during PDF download
+                    await self._close_any_dialogs(page)
+
+                    # Re-navigate to policy page to ensure clean state for appendices
+                    logger.info(f"Re-navigating to policy page to load appendices...")
+                    await page.goto(url, wait_until="networkidle", timeout=30000)
+                    await asyncio.sleep(2)
+
+                    # Scroll to load all appendices
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(2)
+
                     # Download appendices for main insured
                     main_downloads = await self._download_appendices_section(page, appendices_dir)
                     downloaded_files.extend(main_downloads)
@@ -378,9 +427,25 @@ class PhoenixDownloader:
                     for i in range(additional_count):
                         await self._check_cancelled()
                         try:
+                            # Close any open dialogs first
+                            await self._close_any_dialogs(page)
+
                             # Re-find buttons (DOM changes)
                             additional_buttons = page.get_by_role("button", name="לפרטים נוספים")
+                            current_count = await additional_buttons.count()
+
+                            if i >= current_count:
+                                logger.warning(f"Button index {i} out of range (only {current_count} buttons found), skipping")
+                                continue
+
                             btn = additional_buttons.nth(i)
+
+                            # Wait for button to be visible and stable
+                            try:
+                                await btn.wait_for(state="visible", timeout=10000)
+                            except PlaywrightTimeout:
+                                logger.warning(f"Button {i} not visible, skipping")
+                                continue
 
                             # Get person name
                             parent = btn.locator('xpath=ancestor::div[contains(@class, "ng-star")]').first
@@ -400,12 +465,20 @@ class PhoenixDownloader:
                             downloaded_files.extend(person_downloads)
                             logger.info(f"Downloaded {len(person_downloads)} appendices for {person_name}")
 
-                            # Collapse section
-                            await btn.click()
-                            await asyncio.sleep(1)
+                            # Collapse section - re-find button since DOM changed
+                            try:
+                                additional_buttons = page.get_by_role("button", name="לפרטים נוספים")
+                                if await additional_buttons.count() > i:
+                                    collapse_btn = additional_buttons.nth(i)
+                                    await collapse_btn.click()
+                                    await asyncio.sleep(1)
+                            except Exception as collapse_err:
+                                logger.debug(f"Could not collapse section {i}: {collapse_err}")
 
                         except Exception as e:
                             logger.error(f"Error processing additional insured {i+1}: {e}")
+                            # Try to close any dialogs before continuing
+                            await self._close_any_dialogs(page)
                             continue
 
                     policy_file_count = len(main_downloads) + sum(len(p) for p in [person_downloads] if 'person_downloads' in dir())
@@ -573,6 +646,11 @@ class PhoenixDownloader:
         # Alternative: Try expect_download directly without new page
         try:
             logger.info("Trying alternative download method...")
+
+            # First, close any dialogs that might be blocking
+            await self._close_any_dialogs(page)
+            await asyncio.sleep(1)
+
             details_link = None
             for selector in policy_details_selectors:
                 try:
@@ -584,14 +662,31 @@ class PhoenixDownloader:
                     continue
 
             if details_link:
-                async with page.expect_download(timeout=180000) as download_info:
-                    await details_link.click()
+                # Try with force=True to bypass any overlays
+                try:
+                    async with page.expect_download(timeout=180000) as download_info:
+                        await details_link.click(force=True)
 
-                download = await download_info.value
-                save_path = save_dir / f"policy_details_{policy_number}.pdf"
-                await download.save_as(save_path)
-                logger.info(f"Downloaded policy details (alternative method) to {save_path}")
-                return save_path
+                    download = await download_info.value
+                    save_path = save_dir / f"policy_details_{policy_number}.pdf"
+                    await download.save_as(save_path)
+                    logger.info(f"Downloaded policy details (alternative method) to {save_path}")
+                    return save_path
+                except Exception as click_err:
+                    logger.warning(f"Force click failed: {click_err}")
+
+                    # Try JavaScript click as last resort
+                    try:
+                        async with page.expect_download(timeout=180000) as download_info:
+                            await details_link.evaluate("el => el.click()")
+
+                        download = await download_info.value
+                        save_path = save_dir / f"policy_details_{policy_number}.pdf"
+                        await download.save_as(save_path)
+                        logger.info(f"Downloaded policy details (JS click method) to {save_path}")
+                        return save_path
+                    except Exception as js_err:
+                        logger.warning(f"JS click also failed: {js_err}")
 
         except Exception as e:
             logger.error(f"Alternative download method also failed: {e}")
