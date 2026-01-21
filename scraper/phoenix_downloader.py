@@ -269,6 +269,9 @@ class PhoenixDownloader:
         Returns:
             List of paths to downloaded PDF files.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         await self._report_progress(ProgressStage.FINDING_POLICIES)
         page = self._page
         downloaded_files: List[Path] = []
@@ -286,9 +289,26 @@ class PhoenixDownloader:
 
             await self._check_cancelled()
 
-            # Find policy numbers from page content
+            # Log available policy types/sections on the page
             content = await page.content()
+
+            # Check for policy type indicators
+            policy_types = []
+            if 'health' in content.lower() or 'בריאות' in content:
+                policy_types.append('health/בריאות')
+            if 'life' in content.lower() or 'חיים' in content:
+                policy_types.append('life/חיים')
+            if 'pension' in content.lower() or 'פנסיה' in content:
+                policy_types.append('pension/פנסיה')
+            if 'car' in content.lower() or 'רכב' in content:
+                policy_types.append('car/רכב')
+
+            logger.info(f"Detected policy types on page: {policy_types}")
+
+            # Find policy numbers from page content
             policy_matches = re.findall(r'"(\d{10})"', content)
+
+            logger.info(f"Found {len(policy_matches)} potential policy numbers in page content")
 
             # Filter unique policy numbers (exclude known non-policy numbers)
             exclude_numbers = {'1768837064', '2147482998', '2147483000', '2147483647'}
@@ -297,6 +317,8 @@ class PhoenixDownloader:
             for num in policy_matches:
                 if num not in exclude_numbers and not num.startswith("20") and not num.startswith("19"):
                     policy_numbers.add(num)
+
+            logger.info(f"After filtering: {len(policy_numbers)} unique health policy numbers: {policy_numbers}")
 
             if not policy_numbers:
                 await self._report_progress(
@@ -320,6 +342,8 @@ class PhoenixDownloader:
                 await self._check_cancelled()
                 policy_index += 1
 
+                logger.info(f"Processing policy {policy_index}/{len(policy_numbers)}: {policy_number}")
+
                 policy_dir = self.download_dir / f"policy_{policy_number}"
                 policy_dir.mkdir(parents=True, exist_ok=True)
                 appendices_dir = policy_dir / "appendices"
@@ -328,12 +352,19 @@ class PhoenixDownloader:
                 try:
                     # Navigate to policy info page
                     url = f"{self.PORTAL_URL}/policies/health/{policy_number}/info"
+                    logger.info(f"Navigating to: {url}")
                     await page.goto(url, wait_until="networkidle", timeout=30000)
                     await asyncio.sleep(3)
 
                     # Scroll to load content
                     await page.evaluate("window.scrollTo(0, 500)")
                     await asyncio.sleep(1)
+
+                    # Download policy details PDF (contains personal exclusions)
+                    policy_details_path = await self._download_policy_details(page, policy_dir, policy_number)
+                    if policy_details_path:
+                        downloaded_files.append(policy_details_path)
+                        self.download_count += 1
 
                     # Download appendices for main insured
                     main_downloads = await self._download_appendices_section(page, appendices_dir)
@@ -342,6 +373,7 @@ class PhoenixDownloader:
                     # Handle additional insured persons
                     additional_buttons = page.get_by_role("button", name="לפרטים נוספים")
                     additional_count = await additional_buttons.count()
+                    logger.info(f"Found {additional_count} additional insured persons in policy {policy_number}")
 
                     for i in range(additional_count):
                         await self._check_cancelled()
@@ -366,13 +398,18 @@ class PhoenixDownloader:
                             # Download their appendices
                             person_downloads = await self._download_appendices_section(page, person_dir)
                             downloaded_files.extend(person_downloads)
+                            logger.info(f"Downloaded {len(person_downloads)} appendices for {person_name}")
 
                             # Collapse section
                             await btn.click()
                             await asyncio.sleep(1)
 
                         except Exception as e:
+                            logger.error(f"Error processing additional insured {i+1}: {e}")
                             continue
+
+                    policy_file_count = len(main_downloads) + sum(len(p) for p in [person_downloads] if 'person_downloads' in dir())
+                    logger.info(f"Policy {policy_number} complete: downloaded {len(main_downloads)} main appendices + additional insured appendices")
 
                     await self._report_progress(
                         ProgressStage.DOWNLOAD_PROGRESS,
@@ -382,7 +419,15 @@ class PhoenixDownloader:
                     )
 
                 except Exception as e:
+                    logger.error(f"Error processing policy {policy_number}: {e}")
                     continue
+
+            # Final summary
+            logger.info("=" * 50)
+            logger.info("DOWNLOAD SUMMARY")
+            logger.info(f"Total policies processed: {len(policy_numbers)}")
+            logger.info(f"Total files downloaded: {len(downloaded_files)}")
+            logger.info("=" * 50)
 
             await self._report_progress(
                 ProgressStage.DOWNLOAD_COMPLETE,
@@ -399,16 +444,174 @@ class PhoenixDownloader:
             await self._report_progress(ProgressStage.ERROR, error=e)
             raise
 
+    async def _download_policy_details(self, page: Page, save_dir: Path, policy_number: str) -> Optional[Path]:
+        """
+        Download the policy details PDF (העתק תעודת ביטוח).
+
+        This document contains critical information including personal exclusions
+        (החרגות אישיות) that are not in the appendices.
+
+        Args:
+            page: Playwright page object
+            save_dir: Directory to save the PDF
+            policy_number: Policy number for filename
+
+        Returns:
+            Path to downloaded PDF or None if failed
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Selectors for the policy details link in left menu
+        policy_details_selectors = [
+            'a:has-text("העתק תעודת ביטוח")',
+            'button:has-text("העתק תעודת ביטוח")',
+            '[data-test*="certificate"]',
+            'a:has-text("תעודת ביטוח")',
+            'button:has-text("תעודת ביטוח")',
+        ]
+
+        try:
+            logger.info(f"Looking for policy details button for policy {policy_number}")
+
+            details_link = None
+            for selector in policy_details_selectors:
+                try:
+                    element = page.locator(selector).first
+                    if await element.count() > 0:
+                        details_link = element
+                        logger.info(f"Found policy details link with selector: {selector}")
+                        break
+                except Exception:
+                    continue
+
+            if not details_link:
+                logger.warning(f"Could not find policy details link for policy {policy_number}")
+                return None
+
+            # Click the link - this may open a new tab/window or trigger a download
+            # The PDF generation can take 2-3 minutes according to user
+            logger.info("Clicking policy details link, waiting for PDF (may take up to 3 minutes)...")
+
+            # Set up listeners for both new page (popup) and download
+            async with self._context.expect_page(timeout=180000) as new_page_info:
+                try:
+                    await details_link.click()
+                except Exception as click_error:
+                    logger.warning(f"Click error: {click_error}, trying JavaScript click")
+                    await details_link.evaluate("el => el.click()")
+
+            # Wait for new page/popup with PDF
+            try:
+                new_page = await new_page_info.value
+                logger.info(f"New page opened: {new_page.url}")
+
+                # Wait for page to load
+                await new_page.wait_for_load_state("networkidle", timeout=180000)
+                await asyncio.sleep(2)
+
+                # Check if it's a PDF viewer or direct PDF
+                current_url = new_page.url
+
+                if current_url.endswith('.pdf') or 'pdf' in current_url.lower():
+                    # Direct PDF URL - download it
+                    save_path = save_dir / f"policy_details_{policy_number}.pdf"
+
+                    # Try to download using the browser's download mechanism
+                    async with new_page.expect_download(timeout=60000) as download_info:
+                        # Trigger download by pressing Ctrl+S or clicking download button
+                        await new_page.keyboard.press("Control+s")
+
+                    download = await download_info.value
+                    await download.save_as(save_path)
+                    logger.info(f"Downloaded policy details to {save_path}")
+                    await new_page.close()
+                    return save_path
+
+                else:
+                    # It might be a PDF viewer - look for download button or print
+                    # Try to find and click a download/print button
+                    download_btns = [
+                        'button:has-text("הורדה")',
+                        'button:has-text("שמירה")',
+                        'a:has-text("הורדה")',
+                        '[aria-label*="download"]',
+                        '[aria-label*="הורדה"]',
+                    ]
+
+                    for btn_selector in download_btns:
+                        try:
+                            btn = new_page.locator(btn_selector).first
+                            if await btn.count() > 0:
+                                async with new_page.expect_download(timeout=60000) as download_info:
+                                    await btn.click()
+                                download = await download_info.value
+                                save_path = save_dir / f"policy_details_{policy_number}.pdf"
+                                await download.save_as(save_path)
+                                logger.info(f"Downloaded policy details to {save_path}")
+                                await new_page.close()
+                                return save_path
+                        except Exception:
+                            continue
+
+                    # If no download button found, try printing to PDF
+                    logger.info("Trying to capture PDF from page content...")
+                    save_path = save_dir / f"policy_details_{policy_number}.pdf"
+                    await new_page.pdf(path=str(save_path))
+                    logger.info(f"Saved policy details PDF to {save_path}")
+                    await new_page.close()
+                    return save_path
+
+            except PlaywrightTimeout:
+                logger.warning("Timeout waiting for new page with policy details PDF")
+
+        except PlaywrightTimeout:
+            logger.warning(f"Timeout waiting for policy details PDF for policy {policy_number}")
+        except Exception as e:
+            logger.error(f"Error downloading policy details for {policy_number}: {e}")
+
+        # Alternative: Try expect_download directly without new page
+        try:
+            logger.info("Trying alternative download method...")
+            details_link = None
+            for selector in policy_details_selectors:
+                try:
+                    element = page.locator(selector).first
+                    if await element.count() > 0:
+                        details_link = element
+                        break
+                except Exception:
+                    continue
+
+            if details_link:
+                async with page.expect_download(timeout=180000) as download_info:
+                    await details_link.click()
+
+                download = await download_info.value
+                save_path = save_dir / f"policy_details_{policy_number}.pdf"
+                await download.save_as(save_path)
+                logger.info(f"Downloaded policy details (alternative method) to {save_path}")
+                return save_path
+
+        except Exception as e:
+            logger.error(f"Alternative download method also failed: {e}")
+
+        return None
+
     async def _download_appendices_section(self, page: Page, save_dir: Path) -> List[Path]:
         """
         Download all appendices in current view.
         Based on the original phoenix-insurance-scraper logic.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         downloaded: List[Path] = []
 
         # Find all appendix expand buttons
         expand_buttons = page.get_by_role("button", name="למידע נוסף לחץ")
         count = await expand_buttons.count()
+        logger.info(f"Found {count} appendix expand buttons in {save_dir}")
 
         for i in range(count):
             await self._check_cancelled()
@@ -421,18 +624,31 @@ class PhoenixDownloader:
                 # Check if already expanded
                 is_expanded = await btn.get_attribute("aria-expanded")
 
-                # Get appendix name from heading
-                parent_container = btn.locator('xpath=ancestor::div[1]')
+                # Get appendix name from heading - look in parent container
+                parent_container = btn.locator('xpath=ancestor::div[contains(@class, "accordion") or contains(@class, "expansion")]').first
+                if await parent_container.count() == 0:
+                    parent_container = btn.locator('xpath=ancestor::div[1]')
                 heading = parent_container.locator('h5').first
                 appendix_name = await heading.inner_text() if await heading.count() > 0 else f"נספח_{i+1}"
+                logger.info(f"Processing appendix {i+1}/{count}: {appendix_name}")
 
                 # Expand if needed
                 if is_expanded != "true":
                     await btn.click()
                     await asyncio.sleep(2)
 
-                # Find the download button for "הנספח המלא"
-                full_appendix_text = page.locator('p:has-text("הנספח המלא")')
+                # Find the download button for "הנספח המלא" within the expanded section
+                # Look for it relative to the expanded button's container
+                expanded_section = btn.locator('xpath=following-sibling::div[1]')
+                full_appendix_text = expanded_section.locator('p:has-text("הנספח המלא")')
+
+                # If not found in sibling, try the parent's scope
+                if await full_appendix_text.count() == 0:
+                    full_appendix_text = parent_container.locator('p:has-text("הנספח המלא")')
+
+                # Last resort: search in page but be more specific
+                if await full_appendix_text.count() == 0:
+                    full_appendix_text = page.locator('p:has-text("הנספח המלא")').first
 
                 if await full_appendix_text.count() > 0:
                     # Get the parent div and find the button inside it
@@ -454,11 +670,16 @@ class PhoenixDownloader:
                             await download.save_as(save_path)
                             self.download_count += 1
                             downloaded.append(save_path)
+                            logger.info(f"Downloaded appendix {i+1}: {save_path.name}")
 
                         except PlaywrightTimeout:
-                            pass
+                            logger.warning(f"Timeout downloading appendix {i+1}: {appendix_name}")
                         except Exception as e:
-                            pass
+                            logger.error(f"Error downloading appendix {i+1}: {e}")
+                    else:
+                        logger.warning(f"No download button found for appendix {i+1}: {appendix_name}")
+                else:
+                    logger.warning(f"No 'הנספח המלא' text found for appendix {i+1}: {appendix_name}")
 
                 # Collapse the expanded section
                 try:
@@ -468,12 +689,14 @@ class PhoenixDownloader:
                     if is_exp == "true":
                         await btn.click()
                         await asyncio.sleep(0.5)
-                except:
-                    pass
+                except Exception as collapse_err:
+                    logger.debug(f"Could not collapse appendix {i+1}: {collapse_err}")
 
             except Exception as e:
+                logger.error(f"Error processing appendix {i+1}: {e}")
                 continue
 
+        logger.info(f"Downloaded {len(downloaded)} appendices from {save_dir}")
         return downloaded
 
     async def get_policies_count(self) -> int:
